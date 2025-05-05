@@ -1,38 +1,78 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse, FileResponse
 from pymongo import MongoClient
-from gridfs import GridFS
-from bson import ObjectId
+from datetime import datetime
+from bson import Binary, ObjectId
+import io
 
 app = FastAPI()
-client = MongoClient("mongodb://localhost:27017")
-db = client["collab_db"]
-fs = GridFS(db)
-projects = db["projects"]
 
-@app.post("/projects/{project_id}/upload-file/")
-async def upload_file(project_id: str, folder_path: str = Form(...), file: UploadFile = File(...)):
+client = MongoClient("mongodb://admin:admin@localhost:27017/")
 
-    file_id = fs.put(await file.read(), filename=file.filename, content_type=file.content_type)
+db = client["my_dynamic_db"]
 
-    project = projects.find_one({"_id": project_id})
+collection = db["user_data"]
 
-    if not project:
-        return {"error": "Project not found"}
+def serialize_doc(doc):
+    doc["_id"] = str(doc["_id"])
+    if "_received_at" in doc and isinstance(doc["_received_at"], datetime):
+        doc["_received_at"] = doc["_received_at"].isoformat()
+    return doc
 
-    def insert_file_in_folder(folders, path_parts):
-        for folder in folders:
-            if folder["name"] == path_parts[0]:
-                if len(path_parts) == 1:
-                    folder.setdefault("files", []).append({
-                        "name": file.filename,
-                        "type": file.content_type,
-                        "file_id": str(file_id)
-                    })
-                else:
-                    insert_file_in_folder(folder.setdefault("subfolders", []), path_parts[1:])
+@app.post("/collect")
+async def collect_data(file: UploadFile = File(None), body: dict = None):
+    try:
 
-    insert_file_in_folder(project["folders"], folder_path.strip("/").split("/"))
+        if file:
 
-    projects.replace_one({"_id": project_id}, project)
+            file_content = await file.read()
 
-    return {"message": "File uploaded", "file_id": str(file_id)}
+            file_data = {
+                "file_data": Binary(file_content),
+                "file_name": file.filename,
+                "content_type": file.content_type
+            }
+
+        else:
+            file_data = {}
+
+        if body is None:
+            body = {}
+
+        body.update(file_data)
+
+        body["_received_at"] = datetime.utcnow()
+
+        result = collection.insert_one(body)
+
+        return JSONResponse(status_code=200, content={"status": "ok", "id": str(result.inserted_id)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/collect")
+def get_all_data():
+    try:
+
+        data = list(collection.find())
+
+        return JSONResponse(content=[serialize_doc(doc) for doc in data])
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/file/{file_id}")
+async def get_file(file_id: str):
+    try:
+
+        file_data = collection.find_one({"_id": ObjectId(file_id)})
+
+        if file_data and "file_data" in file_data:
+
+            return FileResponse(
+                io.BytesIO(file_data["file_data"]),
+                media_type=file_data["content_type"],
+                filename=file_data["file_name"]
+            )
+        else:
+            return JSONResponse(status_code=404, content={"error": "File not found"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
